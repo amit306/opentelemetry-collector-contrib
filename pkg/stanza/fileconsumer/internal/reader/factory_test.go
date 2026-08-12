@@ -14,6 +14,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/unicode"
 
@@ -315,4 +318,94 @@ func TestNewReaderFromMetadataAfterCompression(t *testing.T) {
 	// bytes for lines 1-2 that were already consumed from the plaintext file.
 	newReader.ReadToEnd(t.Context())
 	sink.ExpectTokens(t, []byte(lines[2]), []byte(lines[3]))
+}
+
+// TestNewReaderFromMetadataFingerprintCollision is a regression test for
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/50167
+func TestNewReaderFromMetadataFingerprintCollision(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	const collisionFingerprintSize = 16
+
+	writeGzipFile := func(name, content string) *os.File {
+		path := filepath.Join(tempDir, name)
+		gzipFile, err := os.Create(path)
+		require.NoError(t, err)
+		gzWriter := gzip.NewWriter(gzipFile)
+		_, err = gzWriter.Write([]byte(content))
+		require.NoError(t, err)
+		require.NoError(t, gzWriter.Close())
+		require.NoError(t, gzipFile.Close())
+
+		readHandle, err := os.Open(path)
+		require.NoError(t, err)
+		return readHandle
+	}
+
+	// Both files' decompressed content shares the same first 16+ bytes, so
+	// under fingerprint_size: 16 the tracker computes an identical
+	// fingerprint for both, even though the files are different sizes and
+	// diverge after the shared prefix.
+	// fileA gets closed by readerA.Close() below; fileB is closed here.
+	sharedPrefix := "2026-08-12 startup sequence begins\n"
+	fileA := writeGzipFile("a.log.gz", sharedPrefix+"a is a small file\n")
+	fileB := writeGzipFile("b.log.gz", sharedPrefix+"b is a much bigger file\nb line 2\nb line 3\nb line 4\n")
+	defer func() { require.NoError(t, fileB.Close()) }()
+
+	f, sink := testFactory(t, withCompression("gzip"), withFingerprintSize(collisionFingerprintSize))
+
+	core, obs := observer.New(zapcore.DebugLevel)
+	f.Logger = zap.New(core)
+
+	fpA, err := f.NewFingerprint(fileA)
+	require.NoError(t, err)
+	fpB, err := f.NewFingerprint(fileB)
+	require.NoError(t, err)
+	require.True(t, fpA.Equal(fpB), "fingerprints must collide for this test to be meaningful")
+
+	// Fully read file A, exactly like the tracker would on the first poll.
+	readerA, err := f.NewReader(fileA, fpA)
+	require.NoError(t, err)
+	readerA.ReadToEnd(t.Context())
+	sink.ExpectTokens(t, []byte("2026-08-12 startup sequence begins"), []byte("a is a small file"))
+
+	// Close it to get the Metadata the tracker would save: Offset now points
+	// to the end of a.log.gz's compressed bytes, and FileType is ".gz".
+	oldMeta := readerA.Close()
+	require.Positive(t, oldMeta.Offset)
+	require.Equal(t, ".gz", oldMeta.FileType)
+
+	// Simulate the tracker matching file B against file A's saved metadata,
+	// because their fingerprints are identical - this is the call the
+	// tracker makes after GetClosedFile / MatchStartsWith succeeds.
+	readerB, err := f.NewReaderFromMetadata(fileB, oldMeta)
+	require.NoError(t, err)
+
+	// This is the bug: because FileType didn't change (".gz" -> ".gz"), the
+	// stale Offset from file A is carried straight into file B's reader,
+	// instead of being reset the way the plaintext-to-gzip case is above.
+	require.Equal(t, oldMeta.Offset, readerB.Offset,
+		"file B inherited file A's Offset, which does not point to a valid position in file B's own gzip stream")
+
+	// ReadToEnd should now fail to decode file B, because readerB.Offset does
+	// not land on a valid gzip header inside file B's compressed bytes.
+	readerB.ReadToEnd(t.Context())
+	sink.ExpectNoCallsUntil(t, 200*time.Millisecond)
+
+	foundExpectedError := false
+	for _, entry := range obs.All() {
+		if entry.Level != zapcore.ErrorLevel || entry.Message != "failed to create gzip reader" {
+			continue
+		}
+		for _, field := range entry.Context {
+			if field.Key == "error" {
+				if err, ok := field.Interface.(error); ok && strings.Contains(err.Error(), "invalid header") {
+					foundExpectedError = true
+				}
+			}
+		}
+	}
+	require.True(t, foundExpectedError,
+		"expected a gzip 'invalid header' error caused by the borrowed offset not pointing to a valid gzip header in file B")
 }
