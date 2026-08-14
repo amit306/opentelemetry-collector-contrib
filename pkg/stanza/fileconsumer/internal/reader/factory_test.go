@@ -375,23 +375,23 @@ func TestNewReaderFromMetadataFingerprintCollision(t *testing.T) {
 	oldMeta := readerA.Close()
 	require.Positive(t, oldMeta.Offset)
 	require.Equal(t, ".gz", oldMeta.FileType)
+	borrowedOffset := oldMeta.Offset
 
 	// Simulate the tracker matching file B against file A's saved metadata,
 	// because their fingerprints are identical - this is the call the
 	// tracker makes after GetClosedFile / MatchStartsWith succeeds.
 	readerB, err := f.NewReaderFromMetadata(fileB, oldMeta)
 	require.NoError(t, err)
+	defer readerB.Close()
+	require.Zero(t,readerB.decompressedBytesToSkip)
 
-	// This is the bug: because FileType didn't change (".gz" -> ".gz"), the
-	// stale Offset from file A is carried straight into file B's reader,
-	// instead of being reset the way the plaintext-to-gzip case is above.
-	require.Equal(t, oldMeta.Offset, readerB.Offset,
-		"file B inherited file A's Offset, which does not point to a valid position in file B's own gzip stream")
 
+    require.Equal(t, borrowedOffset, readerB.Offset,"file B inheried file A's offset,which does not point to a valid gzip header in file B's compressed bytes")
 	// ReadToEnd should now fail to decode file B, because readerB.Offset does
 	// not land on a valid gzip header inside file B's compressed bytes.
 	readerB.ReadToEnd(t.Context())
-	sink.ExpectNoCallsUntil(t, 200*time.Millisecond)
+	//sink.ExpectNoCallsUntil(t, 200*time.Millisecond)
+	sink.ExpectNoCalls(t)
 
 	foundExpectedError := false
 	for _, entry := range obs.All() {
